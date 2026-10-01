@@ -1,6 +1,6 @@
 {
   "name": "pi-session-memory",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "private": true,
   "description": "为 Pi 提供本地文件记忆：从历史会话提取经验、增量归并并按需召回。",
   "type": "module",
