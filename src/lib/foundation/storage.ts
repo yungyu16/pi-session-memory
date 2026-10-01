@@ -44,6 +44,15 @@ export async function readJson<T>(path: string): Promise<T | undefined> {
   }
 }
 
+async function readRecord<T>(path: string): Promise<T | undefined> {
+  try {
+    return await readJson<T>(path);
+  } catch (error) {
+    if (error instanceof SyntaxError) return undefined;
+    throw error;
+  }
+}
+
 /** 文件布局和 I/O 由基础层负责，流程只处理来源状态与结果。 */
 export async function prepareStorage(root: string): Promise<void> {
   await mkdir(join(root, "stage1"), { recursive: true, mode: 0o700 });
@@ -65,18 +74,20 @@ export async function writeRaw(root: string, row: RawMemory): Promise<void> {
 export async function readRetry(root: string): Promise<{
   fingerprint: string;
   retryAt: number;
+  error?: string;
 } | undefined> {
-  return readJson(join(root, "phase2-retry.json"));
+  return readRecord(join(root, "phase2-retry.json"));
 }
 
 export async function writeRetry(
   root: string,
   fingerprint: string,
   retryAt: number,
+  error?: string,
 ): Promise<void> {
   await atomicWrite(
     join(root, "phase2-retry.json"),
-    JSON.stringify({ fingerprint, retryAt }),
+    JSON.stringify({ fingerprint, retryAt, ...(error ? { error } : {}) }),
   );
 }
 
@@ -187,7 +198,7 @@ export async function listCandidates(root: string): Promise<Candidate[]> {
   for (const file of files.filter((file) =>
     /^[a-zA-Z0-9-]+\.json$/.test(file),
   )) {
-    const row = await readJson<Candidate>(join(root, "candidates", file));
+    const row = await readRecord<Candidate>(join(root, "candidates", file));
     if (
       row &&
       typeof row.path === "string" &&
@@ -211,7 +222,7 @@ export async function readRaw(root: string): Promise<RawMemory[]> {
   for (const file of files.filter((file) =>
     /^[a-zA-Z0-9-]+\.json$/.test(file),
   )) {
-    const row = await readJson<RawMemory>(join(root, "stage1", file));
+    const row = await readRecord<RawMemory>(join(root, "stage1", file));
     if (
       row &&
       row.id === file.slice(0, -5) &&

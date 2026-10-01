@@ -37,32 +37,42 @@ export class MemoryRuntime {
       cwd: ctx.cwd,
     });
   };
-  start = (ctx: ExtensionContext): void => {
+  start = (
+    ctx: ExtensionContext,
+  ): "started" | "queued" | "disabled" | "unavailable" => {
+    if (!this.enabled) return "disabled";
     if (
-      !this.enabled ||
       ctx.mode !== "tui" ||
       !ctx.model ||
       !ctx.sessionManager.getSessionFile()
     )
-      return;
+      return "unavailable";
     if (this.running) {
       this.queued = ctx;
-      return;
+      return "queued";
     }
     const signal = this.controller.signal;
     const model = ctx.model;
     const registry = ctx.modelRegistry;
     const activeId = ctx.sessionManager.getSessionId();
     const idle = Number(process.env.PI_MEMORY_IDLE_HOURS ?? LIMITS.idleHours);
+    const configuredTimeout = Number(
+      process.env.PI_MEMORY_MODEL_TIMEOUT_MS ?? 600_000,
+    );
+    const modelTimeoutMs =
+      Number.isFinite(configuredTimeout) && configuredTimeout >= 10_000
+        ? Math.floor(configuredTimeout)
+        : 600_000;
     const inputBudget = Math.min(
       64_000,
       Math.max(1000, Math.floor(model.contextWindow * 0.6)),
     );
+    // 归并会重写完整 MEMORY.md，48,000 字符契约不能由 8,192 tokens 稳定覆盖。
     const outputBudget = Math.max(
       256,
       Math.min(
-        8192,
-        model.maxTokens || 8192,
+        32_768,
+        model.maxTokens || 32_768,
         Math.floor(model.contextWindow * 0.2),
       ),
     );
@@ -76,9 +86,15 @@ export class MemoryRuntime {
         if (!signal.aborted) this.status(text);
       },
       readSession: (path) => readSession(path, Math.min(48_000, inputBudget)),
-      call: createModelCall(model, registry, outputBudget, (amount) => {
-        this.cost += amount;
-      }),
+      call: createModelCall(
+        model,
+        registry,
+        outputBudget,
+        modelTimeoutMs,
+        (amount) => {
+          this.cost += amount;
+        },
+      ),
     })
       .catch((error) => {
         if (signal.aborted) return;
@@ -95,6 +111,7 @@ export class MemoryRuntime {
         if (next && this.enabled) this.start(next);
       });
     // 不等待模型：主会话正常开始；退出/重载取消，下次启动从持久阶段结果继续。
+    return "started";
   };
 }
 

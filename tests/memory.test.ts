@@ -31,6 +31,7 @@ import {
   atomicWrite,
   readSnapshot,
   readRaw,
+  readRetry,
   registerCandidate,
 } from "../src/lib/foundation/storage.ts";
 import {
@@ -39,6 +40,7 @@ import {
   redact,
 } from "../src/lib/foundation/model.ts";
 import { acquireLock } from "../src/lib/foundation/lock.ts";
+import { formatMemoryModelFailure } from "../src/lib/runtime/model.ts";
 import { searchMemory } from "../src/read.ts";
 import {
   LIMITS,
@@ -193,6 +195,7 @@ test("记忆：归并失败保留阶段一成果和旧快照，下次只重跑�
   );
   assert.equal((await readRaw(root)).length, 1);
   assert.equal((await readSnapshot(root)).memory, "");
+  assert.equal((await readRetry(root))?.error, "Error: 归并失败");
   let calls = 0;
   await pipeline(root, async () => {
     calls++;
@@ -267,6 +270,45 @@ test("记忆：单进程锁不抢占，失效进程锁恢复", async (t) => {
   const recovered = await acquireLock(root);
   assert.ok(recovered);
   await recovered();
+
+  await mkdir(join(root, ".pipeline-lock"));
+  assert.equal(await acquireLock(root), undefined);
+  await rm(join(root, ".pipeline-lock"), { recursive: true });
+
+  await mkdir(join(root, ".pipeline-lock"));
+  await writeFile(join(root, ".pipeline-lock", "owner.json"), "损坏 JSON");
+  assert.equal(await acquireLock(root), undefined);
+  const staleOwner = new Date(Date.now() - 121_000);
+  await utimes(join(root, ".pipeline-lock"), staleOwner, staleOwner);
+  const recoveredCorruptOwner = await acquireLock(root);
+  assert.ok(recoveredCorruptOwner);
+  await recoveredCorruptOwner();
+
+  await mkdir(join(root, ".pipeline-lock"));
+  await mkdir(join(root, ".lock-recovery"));
+  const stale = new Date(Date.now() - 121_000);
+  await utimes(join(root, ".pipeline-lock"), stale, stale);
+  await utimes(join(root, ".lock-recovery"), stale, stale);
+  const recoveredIncomplete = await acquireLock(root);
+  assert.ok(recoveredIncomplete);
+  await recoveredIncomplete();
+});
+
+test("记忆：单个损坏状态文件不阻塞其他会话", async (t) => {
+  const root = await temp(t);
+  await mkdir(join(root, "candidates"), { recursive: true });
+  await mkdir(join(root, "stage1"), { recursive: true });
+  await writeFile(join(root, "candidates", "broken.json"), "损坏 JSON");
+  await writeFile(join(root, "stage1", "broken.json"), "损坏 JSON");
+  await writeFile(join(root, "phase2-retry.json"), "损坏 JSON");
+  await candidate(root);
+  await pipeline(root, standard);
+  assert.equal((await readSnapshot(root)).memory, consolidated.memory);
+  assert.equal(await readFile(join(root, "candidates", "broken.json"), "utf8"), "损坏 JSON");
+  assert.equal(await readFile(join(root, "stage1", "broken.json"), "utf8"), "损坏 JSON");
+  await assert.rejects(readFile(join(root, "phase2-retry.json"), "utf8"), {
+    code: "ENOENT",
+  });
 });
 
 test("记忆：关键词检索不写状态；归并只处理变化，按等待顺序选取", async (t) => {
@@ -303,6 +345,18 @@ test("记忆：格式、预算和常见凭据边界", () => {
   assert.deepEqual(
     parseConsolidation(JSON.stringify(consolidated)),
     consolidated,
+  );
+  assert.equal(
+    formatMemoryModelFailure({
+      phase: "归并",
+      model: "ep/gpt-5.6-sol",
+      stopReason: "length",
+      inputChars: 64000,
+      outputChars: 16384,
+      maxTokens: 16384,
+      timeoutMs: 600_000,
+    }),
+    "记忆模型请求未成功完成（阶段=归并，模型=ep/gpt-5.6-sol，stopReason=length，输入=64000字符，输出=16384字符，上限=16384 tokens，超时=600000ms）",
   );
   assert.throws(() =>
     parseConsolidation(JSON.stringify({ memory: "", summary: " \n " })),
@@ -564,12 +618,18 @@ test("记忆：真实宿主 session 文件、启动事件后台两阶段、摘�
     ),
   };
   let calls = 0;
+  const notifications: Array<{ message: string; level?: string }> = [];
   const ctx = {
     cwd: root,
     mode: "tui",
     hasUI: false,
     model: { id: "test", contextWindow: 8000, maxTokens: 4096 },
-    ui: { notify() {}, setStatus() {} },
+    ui: {
+      notify(message: string, level?: string) {
+        notifications.push({ message, level });
+      },
+      setStatus() {},
+    },
     sessionManager: active,
     modelRegistry: {
       streamSimple(
@@ -604,20 +664,53 @@ test("记忆：真实宿主 session 文件、启动事件后台两阶段、摘�
   for (let i = 0; i < 100 && !(await readSnapshot(root)).summary; i++)
     await new Promise((r) => setTimeout(r, 10));
   assert.equal(calls, 2);
+  const memoryCommand = extension.commands.get("memory")!;
+  assert.deepEqual(await memoryCommand.getArgumentCompletions!("r"), [
+    { value: "run", label: "run" },
+    { value: "retry", label: "retry" },
+    { value: "reload", label: "reload" },
+  ]);
+  assert.equal(await memoryCommand.getArgumentCompletions!("x"), null);
   const event = {
     type: "before_agent_start",
     systemPromptOptions: { sections: {} as Record<string, string> },
   };
   await emit("before_agent_start", event);
   assert.ok(event.systemPromptOptions.sections.memory.includes("尚无记忆摘要"));
-  await extension.commands.get("memory")!.handler("reload", ctx as never);
+  await memoryCommand.handler("reload", ctx as never);
   await emit("before_agent_start", event);
   assert.ok(
     event.systemPromptOptions.sections.memory.includes(consolidated.summary),
   );
+  await writeFile(
+    join(root, "phase2-retry.json"),
+    JSON.stringify({
+      fingerprint: "retry",
+      retryAt: Date.now() + 60_000,
+      error: "Error: stopReason=aborted",
+    }),
+  );
+  await memoryCommand.handler("run", ctx as never);
+  assert.match(notifications.at(-1)!.message, /\/memory retry/);
+  await memoryCommand.handler("status", ctx as never);
+  assert.match(notifications.at(-1)!.message, /模型请求超时或被取消/);
+  assert.doesNotMatch(notifications.at(-1)!.message, /记忆入口|fingerprint/);
+  await memoryCommand.handler("debug", ctx as never);
+  assert.match(notifications.at(-1)!.message, /记忆入口|Retry/);
+  await memoryCommand.handler("retry", ctx as never);
+  assert.match(notifications.at(-1)!.message, /已开始|已排队/);
+  assert.equal(await readRetry(root), undefined);
+  await memoryCommand.handler("unknown", ctx as never);
+  assert.match(notifications.at(-1)!.message, /未知子命令/);
+  await writeFile(join(root, "phase2-retry.json"), "损坏 JSON");
+  await memoryCommand.handler("status", ctx as never);
+  assert.match(notifications.at(-1)!.message, /自动记忆：/);
+  await rm(join(root, "phase2-retry.json"));
   await emit("agent_settled", {});
   assert.equal(calls, 2);
-  await extension.commands.get("memory")!.handler("off", ctx as never);
+  await memoryCommand.handler("off", ctx as never);
+  await memoryCommand.handler("run", ctx as never);
+  assert.match(notifications.at(-1)!.message, /已关闭/);
   event.systemPromptOptions.sections = {};
   await emit("before_agent_start", event);
   assert.deepEqual(event.systemPromptOptions.sections, {});

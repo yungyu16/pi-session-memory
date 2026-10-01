@@ -33,6 +33,7 @@ export type ModelCall = (
   system: string,
   input: string,
   signal: AbortSignal,
+  phase?: "提取" | "归并",
 ) => Promise<string>;
 
 export interface PipelineOptions {
@@ -128,6 +129,7 @@ async function extractHistory(options: PipelineOptions): Promise<void> {
                 conversation,
               }),
               signal,
+              "提取",
             ),
           ),
         );
@@ -195,7 +197,7 @@ async function consolidateHistory(options: PipelineOptions): Promise<void> {
   status("归并与整理");
   try {
     const result = parseConsolidation(
-      await call(CONSOLIDATION_PROMPT, input(selected), signal),
+      await call(CONSOLIDATION_PROMPT, input(selected), signal, "归并"),
     );
     signal.throwIfAborted();
     const sources = {
@@ -219,8 +221,10 @@ async function consolidateHistory(options: PipelineOptions): Promise<void> {
       `已归并 ${selected.length} 个会话，待归并 ${pending.length - selected.length} 个`,
     );
   } catch (error) {
-    if (!signal.aborted)
-      await writeRetry(root, fingerprint, now + LIMITS.retryMs);
+    if (!signal.aborted) {
+      const detail = redact(String(error)).slice(0, 500);
+      await writeRetry(root, fingerprint, now + LIMITS.retryMs, detail);
+    }
     throw error;
   }
 }
