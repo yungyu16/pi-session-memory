@@ -1,0 +1,38 @@
+# 依赖与产物
+node_modules/
+dist/
+*.tgz
+*.tsbuildinfo
+
+# 日志与缓存
+*.log
+npm-debug.log*
+.eslintcache
+coverage/
+
+# 环境与凭据（本地私有文件永不提交）
+.env
+.env.*
+!.env.example
+*.pem
+*_rsa
+*_ed25519
+id_rsa
+id_ed25519
+credentials
+secrets.yaml
+
+# 编辑器与 IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# 操作系统
+.DS_Store
+Thumbs.db
+
+# 本地覆盖与 worktree
+*.local
+.worktrees/
